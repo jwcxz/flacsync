@@ -22,6 +22,7 @@ tagtable = { 'title': '--tt',
              'artist': '--ta',
              'album': '--tl',
              'year': '--ty',
+             'date': '--ty',
              'comment': '--tc',
              'tracknumber': '--tn',
              'genre': '--tg' }
