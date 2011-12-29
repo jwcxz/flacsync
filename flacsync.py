@@ -81,45 +81,53 @@ class SyncWorker(threading.Thread):
         self.qresult = None;
 
     def run(self):
-        # do shit
-        flac_esc = self.flac.replace('"', '\\"').replace('$', '\\$');
-        
-        self.dbg = "-> %s: %s\n" %(self.name, self.flac);
+        try:
+            flac_esc = self.flac.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`');
+            
+            self.dbg = "-> %s: %s\n" %(self.name, self.flac);
 
-        # check hash
-        x = os.popen("sha1sum \"%s\"" %(flac_esc));
-        digest = x.read().split(' ')[0];
-        x.close();
+            # check hash
+            x = os.popen("sha1sum \"%s\"" %(flac_esc));
+            digest = x.read().split(' ')[0];
+            x.close();
 
-        dbdgst = None
-        r = self.readquery("select hash from %s where filename=\"%s\";" %(FILETBL, flac_esc));
-        for row in r:
-            dbdgst = r[0][0];
+            dbdgst = None
+            r = self.readquery("select hash from %s where filename=\"%s\";" %(FILETBL, flac_esc));
+            for row in r:
+                dbdgst = r[0][0];
 
-        if dbdgst != None and digest == dbdgst:
-            # don't need to sync this flac
-            self.dbg += "    already done\n"
+            if dbdgst != None and digest == dbdgst:
+                # don't need to sync this flac
+                self.dbg += "    already done\n"
+                print self.dbg;
+                self.stop();
+                return;
+            
+            # we need to sync this one
+            # perform conversion
+            self.dbg += "    converting...\n";
+            r = self.transcode(flac_esc);
+
+            # update hash or insert new row if the transcode was successful
+            if r == None:
+                if dbdgst != None:
+                    self.writequery("update %s set hash=\"%s\" where filename=\"%s\";" %(FILETBL, digest, flac_esc));
+                else:
+                    self.writequery("insert into %s (filename, hash) values (\"%s\", \"%s\");" %(FILETBL, flac_esc, digest));
+
+                self.dbg += "    done!\n"
+
             print self.dbg;
             self.stop();
             return;
-        
-        # we need to sync this one
-        # perform conversion
-        self.dbg += "    converting...\n";
-        r = self.transcode(flac_esc);
-
-        # update hash or insert new row if the transcode was successful
-        if r == None:
-            if dbdgst != None:
-                self.writequery("update %s set hash=\"%s\" where filename=\"%s\";" %(FILETBL, digest, flac_esc));
-            else:
-                self.writequery("insert into %s (filename, hash) values (\"%s\", \"%s\");" %(FILETBL, flac_esc, digest));
-
-            self.dbg += "    done!\n"
-
-        print self.dbg;
-        self.stop();
-        return;
+        except Exception as e:
+            print "## %s (%s): Exception!" %(self.name, self.flac);
+            f = open(LOGFILE, 'a');
+            f.write("ERR: Exception! %s (%s)\n" %(self.name, self.flac));
+            f.close();
+            
+            self.stop();
+            return;
 
     def stop(self):
         self.workers_lk.acquire();
@@ -150,7 +158,7 @@ class SyncWorker(threading.Thread):
             os.mkdir(_d);
 
         mp3 = os.path.join(_d, _f[:-4]+'mp3');
-        mp3_esc = mp3.replace('"', '\\"').replace('$', '\\$');
+        mp3_esc = mp3.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`');
 
         if os.path.exists(mp3):
             os.remove(mp3);
@@ -163,7 +171,8 @@ class SyncWorker(threading.Thread):
         for l in r.split('\n'):
             if l != '':
                 _ = l.split('=', 1);
-                tags[_[0].lower()] = _[1];
+                if len(_) == 2:
+                    tags[_[0].lower()] = _[1];
 
         # convert tags to MP3speak
         tagopts = "";
@@ -172,7 +181,7 @@ class SyncWorker(threading.Thread):
                 if tag == 'tracknumber':
                     tagopts += "%s %s " %(tagtable[tag], tags[tag]);
                 else:
-                    tagopts += "%s \"%s\" " %(tagtable[tag], tags[tag].replace('"', '\\"').replace('$', '\\$'));
+                    tagopts += "%s \"%s\" " %(tagtable[tag], tags[tag].replace('"', '\\"').replace('$', '\\$').replace('`', '\\`'));
 
         # transcode
         flac_log = os.path.join(CFGBASE, self.name+"_flac.log");
@@ -193,8 +202,8 @@ class SyncWorker(threading.Thread):
             flaclog = open(flac_log, 'r');
             lamelog = open(lame_log, 'r');
             f.write("ERR: %s returned %d\n" %(self.flac, ret));
-            f.write("     flac: %s", flaclog.read());
-            f.write("     lame: %s", lamelog.read());
+            f.write("     flac: %s" %(flaclog.read()));
+            f.write("     lame: %s" %(lamelog.read()));
             f.close();
             flaclog.close();
             lamelog.close();
@@ -272,6 +281,11 @@ if __name__ == "__main__":
     elif not os.path.isdir(CFGBASE):
         os.remove(CFGBASE);
         os.mkdir(CFGBASE);
+        
+    # clear log file
+    f = open(LOGFILE, 'a');
+    f.write("---------------------------------------\n");
+    f.close();
 
     # walk through the music directory looking for folders with FLACs
     print "-> searching for flacs...",
