@@ -1,0 +1,7 @@
+flacsync
+========
+
+flacsync makes it easy to keep up-to-date copies of MP3 files in music
+directories containing flacs.
+
+TODO: configuration system, make it really work, fine-tune
