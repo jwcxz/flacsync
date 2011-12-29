@@ -4,4 +4,10 @@ flacsync
 flacsync makes it easy to keep up-to-date copies of MP3 files in music
 directories containing flacs.
 
-TODO: configuration system, make it really work, fine-tune
+See flacsync.py -h for usage information (you can change the directory to parse
+with -d and the number of worker threads with -n).
+
+It tries to copy as many FLAC tags to MP3 tags as possible.  If there are
+photos in the same folder, it will try to embed them into the MP3 based on
+the filename (e.g. images containing the word "front" are embedded and given
+the "Front Cover" tag.
