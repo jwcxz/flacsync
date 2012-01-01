@@ -20,6 +20,7 @@ LOGFILE = os.path.join(CFGBASE, "log");
 FILETBL = "flacs";
 NUMWORKERS = 8;
 MUSICDIR = os.path.expanduser("~/media/music");
+MP3DIR = ".mp3";
 
 tagtable = { 'title': '--tt',
              'artist': '--ta',
@@ -150,7 +151,7 @@ class SyncWorker(threading.Thread):
         # convert flac to mp3
         _f = os.path.basename(self.flac);
         _b = os.path.dirname(self.flac);
-        _d = os.path.join(_b, ".mp3");
+        _d = os.path.join(_b, MP3DIR);
 
         if not os.path.exists(_d):
             os.mkdir(_d);
@@ -264,9 +265,12 @@ if __name__ == "__main__":
             prog="ACRIS Client");
 
     parser.add_argument('-n', '--num-workers', action='store',
-            dest='numworkers', default=8, type=int, help='number of simultaneously working threads');
+            dest='numworkers', default=NUMWORKERS, type=int, help='number of simultaneously working threads');
     parser.add_argument('-d', '--directory', action='store',
-            dest='musicdir', default='~/media/music', help='directory to operate on');
+            dest='musicdir', default=MUSICDIR, help='directory to operate on');
+    parser.add_argument('-m', '--mp3', action='store',
+            dest='musicdir', default=MP3DIR, help='directory to store MP3s in');
+    
     
     args = parser.parse_args();
     MUSICDIR = os.path.expanduser(args.musicdir);
