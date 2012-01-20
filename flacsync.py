@@ -20,7 +20,7 @@ LOGFILE = os.path.join(CFGBASE, "log");
 FILETBL = "flacs";
 NUMWORKERS = 8;
 MUSICDIR = os.path.expanduser("~/media/music");
-MP3DIR = ".mp3";
+MP3DIR = "_mp3";
 
 tagtable = { 'title': '--tt',
              'artist': '--ta',
@@ -261,20 +261,20 @@ class SyncWorker(threading.Thread):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Converts FLACs to MP3s, preserving as much tag information as possible",
-            epilog="Runs a raw command when no switches are given; brings up a color chooser if rgb arguments are required but not given", 
-            prog="ACRIS Client");
+            prog="flacsync");
 
     parser.add_argument('-n', '--num-workers', action='store',
             dest='numworkers', default=NUMWORKERS, type=int, help='number of simultaneously working threads');
     parser.add_argument('-d', '--directory', action='store',
             dest='musicdir', default=MUSICDIR, help='directory to operate on');
     parser.add_argument('-m', '--mp3', action='store',
-            dest='musicdir', default=MP3DIR, help='directory to store MP3s in');
+            dest='mp3dir', default=MP3DIR, help='directory to store MP3s in');
     
     
     args = parser.parse_args();
     MUSICDIR = os.path.expanduser(args.musicdir);
     NUMWORKERS = args.numworkers;
+    MP3DIR = args.mp3dir;
     
     # make sure path exists
     if not os.path.exists(MUSICDIR) or not os.path.isdir(MUSICDIR):
