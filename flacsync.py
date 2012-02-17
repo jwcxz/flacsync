@@ -32,6 +32,25 @@ tagtable = { 'title': '--tt',
              'genre': '--tg' }
 
 
+class QueryClient:
+    qresult = None;
+
+    def __init__(self, db):
+        self.qresult = None;
+        self.db = db;
+
+    def readquery(self, query):
+        self.qresult = None;
+        self.db.rdq.append( (self, query) );
+        while self.qresult == None:
+            time.sleep(0);
+
+        return self.qresult;
+
+    def writequery(self, query):
+        self.db.wrq.append( (self, query) );
+
+
 class DBWorker(threading.Thread):
     def __init__(self):
         threading.Thread.__init__(self);
@@ -69,12 +88,13 @@ class DBWorker(threading.Thread):
         self.enabled = False;
 
 
-class SyncWorker(threading.Thread):
+class SyncWorker(threading.Thread, QueryClient):
     dbg = "";
 
-    def __init__(self, db, workers, workers_lk, flac):
+    def __init__(self, digests, db, workers, workers_lk, flac):
         threading.Thread.__init__(self);
 
+        self.digests = digests;
         self.db = db;
         self.flac = flac
         self.workers = workers;
@@ -93,12 +113,13 @@ class SyncWorker(threading.Thread):
             digest = x.read().split(' ')[0];
             x.close();
 
-            dbdgst = None
-            r = self.readquery("select hash from %s where filename=\"%s\";" %(FILETBL, flac_esc));
-            for row in r:
-                dbdgst = r[0][0];
+            #dbdgst = None
+            #r = self.readquery("select hash from %s where filename=\"%s\";" %(FILETBL, flac_esc));
+            #for row in r:
+                #dbdgst = r[0][0];
 
-            if dbdgst != None and digest == dbdgst:
+            # check to see if it has already been synced
+            if flac_esc in self.digests and digest == self.digests[flac_esc]:
                 # don't need to sync this flac
                 self.dbg += "    already done\n"
                 print self.dbg;
@@ -306,6 +327,15 @@ if __name__ == "__main__":
     dbthread.start();
     print "done"
 
+    # get list of digests from the db
+    digests = {};
+    print "-> getting list of digests...",
+    mtq = QueryClient(dbthread);
+    rslt = mtq.readquery("select filename, hash from %s;" %(FILETBL));
+    for r in rslt:
+        digests[r[0]] = r[1];
+    print "done"
+
     print "-> performing sync with %d workers on %d tracks" %(NUMWORKERS, len(filequeue)-1)
     workers = [];
     workers_lk = threading.Semaphore();
@@ -314,7 +344,7 @@ if __name__ == "__main__":
     while i < len(filequeue)-1:
         if len(workers) < NUMWORKERS:
             workers_lk.acquire();
-            workers.append( SyncWorker(dbthread, workers, workers_lk, filequeue[i]) );
+            workers.append( SyncWorker(digests, dbthread, workers, workers_lk, filequeue[i]) );
             workers[-1].start();
             workers_lk.release();
             i += 1
