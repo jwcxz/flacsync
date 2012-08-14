@@ -72,13 +72,14 @@ class DBWorker(threading.Thread):
 class SyncWorker(threading.Thread):
     dbg = "";
 
-    def __init__(self, db, workers, workers_lk, flac):
+    def __init__(self, db, workers, workers_lk, flac, force):
         threading.Thread.__init__(self);
 
         self.db = db;
         self.flac = flac
         self.workers = workers;
         self.workers_lk = workers_lk;
+        self.force = force;
 
         self.qresult = None;
 
@@ -87,7 +88,7 @@ class SyncWorker(threading.Thread):
             flac_esc = self.flac.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`');
             
             self.dbg = "-> %s: %s\n" %(self.name, self.flac);
-
+            
             # check hash
             x = os.popen("sha1sum \"%s\"" %(flac_esc));
             digest = x.read().split(' ')[0];
@@ -98,7 +99,7 @@ class SyncWorker(threading.Thread):
             for row in r:
                 dbdgst = r[0][0];
 
-            if dbdgst != None and digest == dbdgst:
+            if not self.force and dbdgst != None and digest == dbdgst:
                 # don't need to sync this flac
                 self.dbg += "    already done\n"
                 print self.dbg;
@@ -192,7 +193,7 @@ class SyncWorker(threading.Thread):
         flac_cmd = "flac -s -cd \"%s\" 2>\"%s\"" \
                     %(flac_esc, flac_log);
 
-        lame_cmd = "lame --silent --cbr -b 320 --add-id3v2 %s - \"%s\" 2>\"%s\"" \
+        lame_cmd = "lame --silent -V 0 --add-id3v2 %s - \"%s\" 2>\"%s\"" \
                     %(tagopts, mp3_esc, lame_log);
 
         x = os.popen("%s | %s" %(flac_cmd, lame_cmd));
@@ -269,12 +270,15 @@ if __name__ == "__main__":
             dest='musicdir', default=MUSICDIR, help='directory to operate on');
     parser.add_argument('-m', '--mp3', action='store',
             dest='mp3dir', default=MP3DIR, help='directory to store MP3s in');
+    parser.add_argument('-f', '--force', action='store_true',
+            dest='force', default=False, help='convert all discovered tracks');
     
     
     args = parser.parse_args();
     MUSICDIR = os.path.expanduser(args.musicdir);
     NUMWORKERS = args.numworkers;
     MP3DIR = args.mp3dir;
+    FORCE = args.force;
     
     # make sure path exists
     if not os.path.exists(MUSICDIR) or not os.path.isdir(MUSICDIR):
@@ -314,7 +318,7 @@ if __name__ == "__main__":
     while i < len(filequeue)-1:
         if len(workers) < NUMWORKERS:
             workers_lk.acquire();
-            workers.append( SyncWorker(dbthread, workers, workers_lk, filequeue[i]) );
+            workers.append( SyncWorker(dbthread, workers, workers_lk, filequeue[i], FORCE) );
             workers[-1].start();
             workers_lk.release();
             i += 1
