@@ -258,10 +258,17 @@ if __name__ == "__main__":
     # walk through the music directory looking for folders with FLACs
     print "-> searching for flacs...",
     _ = os.popen("find \"%s\" -iname \"*.flac\" -type f -print0" %(MUSICDIR));
-    filequeue = _.read();
+    filelist = _.read();
     _.close();
-    filequeue = filequeue.split('\0');
+    filelist = filelist.split('\0');
     print "done"
+
+    print "-> sorting queue by mtime...",
+    filequeue = []
+    for track in filelist:
+        if track != "": filequeue.append( (track, os.stat(track).st_mtime) );
+    filequeue.sort(key=lambda _: _[1], reverse=True);
+    print "done!"
 
     print "-> loading hash list"
     if not os.path.exists(DBFILE):
@@ -280,7 +287,7 @@ if __name__ == "__main__":
     while i < len(filequeue)-1:
         if len(workers) < NUMWORKERS:
             workers_lk.acquire();
-            workers.append( SyncWorker(flachashes, workers, workers_lk, filequeue[i], FORCE) );
+            workers.append( SyncWorker(flachashes, workers, workers_lk, filequeue[i][0], FORCE) );
             workers[-1].start();
             workers_lk.release();
             i += 1
