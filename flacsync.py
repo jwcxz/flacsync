@@ -4,10 +4,9 @@
 # Goes through a library of music and converts FLACs to MP3s, preserving as
 # much tag information as it can.
 
-# Keeps an sqlite database of file hashes to prevent needless resyncing
+# Uses a memory mapping to remember which things were already sync'd.
 
 
-import sqlite3 as sql
 import argparse, hashlib, pickle, subprocess, sys, os, time, threading
 from mutagen import mp3 as mutmp3
 from mutagen import id3 as mutid3
@@ -32,73 +31,17 @@ tagtable = { 'title': '--tt',
              'genre': '--tg' }
 
 
-class QueryClient:
-    qresult = None;
-
-    def __init__(self, db):
-        self.qresult = None;
-        self.db = db;
-
-    def readquery(self, query):
-        self.qresult = None;
-        self.db.rdq.append( (self, query) );
-        while self.qresult == None:
-            time.sleep(0);
-
-        return self.qresult;
-
-    def writequery(self, query):
-        self.db.wrq.append( (self, query) );
-
-
-class DBWorker(threading.Thread):
-    def __init__(self):
-        threading.Thread.__init__(self);
-        self.wrq = [];
-        self.rdq = [];
-        self.enabled = True;
-
-    def run(self):
-        self.cxn = sql.connect(DBFILE);
-
-        # build filename and dir hash tables
-        self.cxn.execute("create table if not exists %s (filename text, hash varchar(40), primary key (filename));" %(FILETBL));
-
-        while self.enabled:
-            # continually poll the queues
-            if len(self.rdq) > 0:
-                wrkr, query = self.rdq[0];
-                self.rdq.pop(0);
-                r = self.cxn.execute(query);
-                _ = [];
-                for row in r:
-                    _.append(row);
-                wrkr.qresult = _;
-
-            if len(self.wrq) > 0:
-                wrkr, query = self.wrq[0];
-                self.wrq.pop(0);
-                self.cxn.execute(query);
-                self.cxn.commit();
-                wrkr.qresult = True;
-            
-            time.sleep(0);
-
-    def stop(self):
-        self.enabled = False;
-
-
-class SyncWorker(threading.Thread, QueryClient):
+class SyncWorker(threading.Thread):
     dbg = "";
 
-    def __init__(self, digests, db, workers, workers_lk, flac):
+    def __init__(self, db, workers, workers_lk, flac, force):
         threading.Thread.__init__(self);
 
-        self.digests = digests;
         self.db = db;
         self.flac = flac
         self.workers = workers;
         self.workers_lk = workers_lk;
+        self.force = force;
 
         self.qresult = None;
 
@@ -107,24 +50,24 @@ class SyncWorker(threading.Thread, QueryClient):
             flac_esc = self.flac.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`');
             
             self.dbg = "-> %s: %s\n" %(self.name, self.flac);
-
+            
             # check hash
-            x = os.popen("sha1sum \"%s\"" %(flac_esc));
+            x = os.popen("md5sum \"%s\"" %(flac_esc));
             digest = x.read().split(' ')[0];
             x.close();
 
-            #dbdgst = None
-            #r = self.readquery("select hash from %s where filename=\"%s\";" %(FILETBL, flac_esc));
-            #for row in r:
-                #dbdgst = r[0][0];
+            if not self.force:
+                if flac_esc in self.db:
+                    dbdgst = self.db[flac_esc];
+                else:
+                    dbdgst = None
 
-            # check to see if it has already been synced
-            if flac_esc in self.digests and digest == self.digests[flac_esc]:
-                # don't need to sync this flac
-                self.dbg += "    already done\n"
-                print self.dbg;
-                self.stop();
-                return;
+                if dbdgst != None and digest == dbdgst:
+                    # don't need to sync this flac
+                    self.dbg += "    already done\n"
+                    print self.dbg;
+                    self.stop();
+                    return;
             
             # we need to sync this one
             # perform conversion
@@ -133,11 +76,7 @@ class SyncWorker(threading.Thread, QueryClient):
 
             # update hash or insert new row if the transcode was successful
             if r == None:
-                if dbdgst != None:
-                    self.writequery("update %s set hash=\"%s\" where filename=\"%s\";" %(FILETBL, digest, flac_esc));
-                else:
-                    self.writequery("insert into %s (filename, hash) values (\"%s\", \"%s\");" %(FILETBL, flac_esc, digest));
-
+                self.db[flac_esc] = digest
                 self.dbg += "    done!\n"
 
             print self.dbg;
@@ -213,7 +152,7 @@ class SyncWorker(threading.Thread, QueryClient):
         flac_cmd = "flac -s -cd \"%s\" 2>\"%s\"" \
                     %(flac_esc, flac_log);
 
-        lame_cmd = "lame --silent --cbr -b 320 --add-id3v2 %s - \"%s\" 2>\"%s\"" \
+        lame_cmd = "lame --silent -V 0 --add-id3v2 %s - \"%s\" 2>\"%s\"" \
                     %(tagopts, mp3_esc, lame_log);
 
         x = os.popen("%s | %s" %(flac_cmd, lame_cmd));
@@ -290,12 +229,15 @@ if __name__ == "__main__":
             dest='musicdir', default=MUSICDIR, help='directory to operate on');
     parser.add_argument('-m', '--mp3', action='store',
             dest='mp3dir', default=MP3DIR, help='directory to store MP3s in');
+    parser.add_argument('-f', '--force', action='store_true',
+            dest='force', default=False, help='convert all discovered tracks');
     
     
     args = parser.parse_args();
     MUSICDIR = os.path.expanduser(args.musicdir);
     NUMWORKERS = args.numworkers;
     MP3DIR = args.mp3dir;
+    FORCE = args.force;
     
     # make sure path exists
     if not os.path.exists(MUSICDIR) or not os.path.isdir(MUSICDIR):
@@ -316,24 +258,25 @@ if __name__ == "__main__":
     # walk through the music directory looking for folders with FLACs
     print "-> searching for flacs...",
     _ = os.popen("find \"%s\" -iname \"*.flac\" -type f -print0" %(MUSICDIR));
-    filequeue = _.read();
+    filelist = _.read();
     _.close();
-    filequeue = filequeue.split('\0');
+    filelist = filelist.split('\0');
     print "done"
 
-    # create and start database thread
-    print "-> starting database thread...",
-    dbthread = DBWorker();
-    dbthread.start();
-    print "done"
+    print "-> sorting queue by mtime...",
+    filequeue = []
+    for track in filelist:
+        if track != "": filequeue.append( (track, os.stat(track).st_mtime) );
+    filequeue.sort(key=lambda _: _[1], reverse=True);
+    print "done!"
 
-    # get list of digests from the db
-    digests = {};
-    print "-> getting list of digests...",
-    mtq = QueryClient(dbthread);
-    rslt = mtq.readquery("select filename, hash from %s;" %(FILETBL));
-    for r in rslt:
-        digests[r[0]] = r[1];
+    print "-> loading hash list"
+    if not os.path.exists(DBFILE):
+        flachashes = {}
+    else:
+        fh_fl = open(DBFILE, 'r');
+        flachashes = pickle.load(fh_fl);
+        fh_fl.close();
     print "done"
 
     print "-> performing sync with %d workers on %d tracks" %(NUMWORKERS, len(filequeue)-1)
@@ -344,7 +287,7 @@ if __name__ == "__main__":
     while i < len(filequeue)-1:
         if len(workers) < NUMWORKERS:
             workers_lk.acquire();
-            workers.append( SyncWorker(digests, dbthread, workers, workers_lk, filequeue[i]) );
+            workers.append( SyncWorker(flachashes, workers, workers_lk, filequeue[i][0], FORCE) );
             workers[-1].start();
             workers_lk.release();
             i += 1
@@ -354,5 +297,12 @@ if __name__ == "__main__":
     while len(workers) > 0:
         time.sleep(0);
 
+
+    print "-> saving hash list"
+    fh_fl = open(DBFILE, 'w');
+    pickle.dump(flachashes, fh_fl);
+    fh_fl.close();
+    print "done"
+
+
     print "## done"
-    dbthread.stop();
