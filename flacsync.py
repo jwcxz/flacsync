@@ -283,8 +283,7 @@ if __name__ == "__main__":
     workers = [];
     workers_lk = threading.Semaphore();
     i = 0
-    # last entry in filequeue is just '', so ignore it
-    while i < len(filequeue)-1:
+    while i < len(filequeue):
         if len(workers) < NUMWORKERS:
             workers_lk.acquire();
             workers.append( SyncWorker(flachashes, workers, workers_lk, filequeue[i][0], FORCE) );
