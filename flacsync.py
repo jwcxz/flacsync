@@ -6,8 +6,12 @@
 
 # Uses a memory mapping to remember which things were already sync'd.
 
+# Uses multiprocessing to actually perform simultaneous processing, though the
+# program is probably i/o limited anyways.
 
-import argparse, hashlib, pickle, subprocess, sys, os, time, threading
+
+import argparse, hashlib, pickle, subprocess, sys, os, tempfile, time
+from multiprocessing import Pool
 from mutagen import mp3 as mutmp3
 from mutagen import id3 as mutid3
 
@@ -31,192 +35,161 @@ tagtable = { 'title': '--tt',
              'genre': '--tg' }
 
 
-class SyncWorker(threading.Thread):
+
+def process_track(trackdata):
+    flac = trackdata[0];
     dbg = "";
 
-    def __init__(self, db, workers, workers_lk, flac, force):
-        threading.Thread.__init__(self);
-
-        self.db = db;
-        self.flac = flac
-        self.workers = workers;
-        self.workers_lk = workers_lk;
-        self.force = force;
-
-        self.qresult = None;
-
-    def run(self):
-        try:
-            flac_esc = self.flac.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`');
-            
-            self.dbg = "-> %s: %s\n" %(self.name, self.flac);
-            
-            # check hash
-            x = os.popen("md5sum \"%s\"" %(flac_esc));
-            digest = x.read().split(' ')[0];
-            x.close();
-
-            if not self.force:
-                if flac_esc in self.db:
-                    dbdgst = self.db[flac_esc];
-                else:
-                    dbdgst = None
-
-                if dbdgst != None and digest == dbdgst:
-                    # don't need to sync this flac
-                    self.dbg += "    already done\n"
-                    print self.dbg;
-                    self.stop();
-                    return;
-            
-            # we need to sync this one
-            # perform conversion
-            self.dbg += "    converting...\n";
-            r = self.transcode(flac_esc);
-
-            # update hash or insert new row if the transcode was successful
-            if r == None:
-                self.db[flac_esc] = digest
-                self.dbg += "    done!\n"
-
-            print self.dbg;
-            self.stop();
-            return;
-        except Exception as e:
-            print "## %s (%s): Exception!" %(self.name, self.flac);
-            f = open(LOGFILE, 'a');
-            f.write("ERR: Exception! %s (%s)\n" %(self.name, self.flac));
-            f.close();
-            
-            self.stop();
-            return;
-
-    def stop(self):
-        self.workers_lk.acquire();
-        self.workers.remove(self);
-        self.workers_lk.release();
-
-    def readquery(self, query):
-        self.qresult = None;
-        self.db.rdq.append( (self, query) );
-        while self.qresult == None:
-            time.sleep(0);
-
-        return self.qresult;
-
-    def writequery(self, query):
-        self.db.wrq.append( (self, query) );
-
-    def transcode(self, flac_esc):
-        # convert flac to mp3
-        _f = os.path.basename(self.flac);
-        _b = os.path.dirname(self.flac);
-        _d = os.path.join(_b, MP3DIR);
-
-        if not os.path.exists(_d):
-            os.mkdir(_d);
-        elif not os.path.isdir(_d):
-            os.remove(_d);
-            os.mkdir(_d);
-
-        mp3 = os.path.join(_d, _f[:-4]+'mp3');
-        mp3_esc = mp3.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`');
-
-        if os.path.exists(mp3):
-            os.remove(mp3);
-
-        # extract available tags
-        tags = {};
-        x = os.popen("metaflac --export-tags-to=- \"%s\"" %(flac_esc));
-        r = x.read();
+    try:
+        flac_esc = flac.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`');
+        
+        dbg += "-> %s\n" %(flac);
+        
+        # check hash
+        x = open(flac, 'r');
+        # the first 4096 bytes should be more than enough to hold important
+        # header info
+        xd = x.read(4096); 
         x.close();
-        for l in r.split('\n'):
-            if l != '':
-                _ = l.split('=', 1);
-                if len(_) == 2:
-                    tags[_[0].lower()] = _[1];
+        digest = hashlib.md5(xd).hexdigest();
 
-        # convert tags to MP3speak
-        tagopts = "";
-        for tag in tags.keys():
-            if tag in tagtable.keys():
-                if tag == 'tracknumber':
-                    tagopts += "%s %s " %(tagtable[tag], tags[tag]);
-                else:
-                    tagopts += "%s \"%s\" " %(tagtable[tag], tags[tag].replace('"', '\\"').replace('$', '\\$').replace('`', '\\`'));
+        if not FORCE:
+            if flac_esc in FLACHASHES:
+                dbdgst = FLACHASHES[flac_esc];
+            else:
+                dbdgst = None
 
-        # transcode
-        flac_log = os.path.join(CFGBASE, self.name+"_flac.log");
-        lame_log = os.path.join(CFGBASE, self.name+"_lame.log");
+            if dbdgst != None and digest == dbdgst:
+                # don't need to sync this flac
+                dbg += "    already done\n";
+                print dbg;
+                return None;
         
-        flac_cmd = "flac -s -cd \"%s\" 2>\"%s\"" \
-                    %(flac_esc, flac_log);
+        # we need to sync this one
+        # perform conversion
+        dbg += "    converting...\n";
+        r, rdbg = transcode(flac, flac_esc);
 
-        lame_cmd = "lame --silent -V 0 --add-id3v2 %s - \"%s\" 2>\"%s\"" \
-                    %(tagopts, mp3_esc, lame_log);
+        dbg += rdbg;
 
-        x = os.popen("%s | %s" %(flac_cmd, lame_cmd));
-        ret = x.close();
-        
-        if ret:
-            self.dbg += "    ## ERROR: command returned %d\n" %(ret);
-            f = open(LOGFILE, 'a');
-            flaclog = open(flac_log, 'r');
-            lamelog = open(lame_log, 'r');
-            f.write("ERR: %s returned %d\n" %(self.flac, ret));
-            f.write("     flac: %s" %(flaclog.read()));
-            f.write("     lame: %s" %(lamelog.read()));
-            f.close();
-            flaclog.close();
-            lamelog.close();
-            
-            os.remove(flac_log);
-            os.remove(lame_log);
+        # update hash or insert new row if the transcode was successful
+        if r == None:
+            dbg += "    done!\n"
 
-            return ret;
-        
-        # otherwise search for pictures in the directory and apply them
-        files = os.listdir(_b);
-        files.reverse();    # probably will get better results this way
-        m = mutmp3.MP3(mp3);
-        tag = None;
-        for fl in files:
-            fll = fl.lower();
-            if fll[-4:] in ['.jpg', '.png', 'jpeg']:
-                if 'small' in fll:
-                    continue;
-                # found an image; now try to match it for a image type
-                if 'front' in fll or 'cover' in fll:
-                    tag = (3, 'Front cover');
-                elif 'back' in fll or 'rear' in fll:
-                    tag = (4, 'Back cover');
-                elif 'folder' in fll:
-                    tag = (5, 'Leaflet');
-                elif 'cd' in fll:
-                    tag = (6, 'Media');
-                else:
-                    tag = (0, 'Other');
-                    
-                if fll[-4:] in ['.jpg', 'jpeg']:
-                    imtype = 'image/jpg';
-                else:
-                    imtype = 'image/png';
-                    
-                self.dbg += "    -> found image: %s (%d, %s)\n" %(fl, tag[0], tag[1]);
-                imgf = open(os.path.join(_b, fl), 'rb')
-                img = imgf.read();
-                imgf.close();
-                
-                m.tags.add(mutid3.APIC(3, imtype, tag[0], tag[1], img));
-                
-        if tag != None:
-            m.save();
-
-        # remove temporary logs and finish
-        os.remove(flac_log);
-        os.remove(lame_log);
-
+        print dbg;
+        return (flac_esc, digest);
+    except Exception as e:
+        print "## %s %r: Exception!" %(flac, e);
+        f = open(LOGFILE, 'a');
+        f.write("ERR: Exception! %s %r\n" %(flac, e));
+        f.close();
         return None;
+
+
+def transcode(flac, flac_esc):
+    # convert flac to mp3
+    _f = os.path.basename(flac);
+    _b = os.path.dirname(flac);
+    _d = os.path.join(_b, MP3DIR);
+
+    dbg = "";
+
+    if not os.path.exists(_d):
+        os.mkdir(_d);
+    elif not os.path.isdir(_d):
+        os.remove(_d);
+        os.mkdir(_d);
+
+    mp3 = os.path.join(_d, _f[:-4]+'mp3');
+    mp3_esc = mp3.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`');
+
+    if os.path.exists(mp3):
+        os.remove(mp3);
+
+    # extract available tags
+    tags = {};
+    x = os.popen("metaflac --export-tags-to=- \"%s\"" %(flac_esc));
+    r = x.read();
+    x.close();
+    for l in r.split('\n'):
+        if l != '':
+            _ = l.split('=', 1);
+            if len(_) == 2:
+                tags[_[0].lower()] = _[1];
+
+    # convert tags to MP3speak
+    tagopts = "";
+    for tag in tags.keys():
+        if tag in tagtable.keys():
+            if tag == 'tracknumber':
+                tagopts += "%s %s " %(tagtable[tag], tags[tag]);
+            else:
+                tagopts += "%s \"%s\" " %(tagtable[tag], tags[tag].replace('"', '\\"').replace('$', '\\$').replace('`', '\\`'));
+
+    # transcode
+    flac_log = tempfile.NamedTemporaryFile(dir=CFGBASE);
+    lame_log = tempfile.NamedTemporaryFile(dir=CFGBASE);
+    
+    flac_cmd = "flac -s -cd \"%s\" 2>\"%s\"" \
+                %(flac_esc, flac_log.name);
+
+    lame_cmd = "lame --silent -V 0 --add-id3v2 %s - \"%s\" 2>\"%s\"" \
+                %(tagopts, mp3_esc, lame_log.name);
+
+    x = os.popen("%s | %s" %(flac_cmd, lame_cmd));
+    ret = x.close();
+    
+    if ret:
+        dbg += "    ## ERROR: command returned %d\n" %(ret);
+        f = open(LOGFILE, 'a');
+        f.write("ERR: %s returned %d\n" %(flac, ret));
+        f.write("     flac: %s" %(flac_log.read()));
+        f.write("     lame: %s" %(lame_log.read()));
+        f.close();
+        flac_log.close();
+        lame_log.close();
+
+        return (ret, dbg);
+    
+    # otherwise search for pictures in the directory and apply them
+    files = os.listdir(_b);
+    files.reverse();    # probably will get better results this way
+    m = mutmp3.MP3(mp3);
+    tag = None;
+    for fl in files:
+        fll = fl.lower();
+        if fll[-4:] in ['.jpg', '.png', 'jpeg']:
+            if 'small' in fll:
+                continue;
+            # found an image; now try to match it for a image type
+            if 'front' in fll or 'cover' in fll:
+                tag = (3, 'Front cover');
+            elif 'back' in fll or 'rear' in fll:
+                tag = (4, 'Back cover');
+            elif 'folder' in fll:
+                tag = (5, 'Leaflet');
+            elif 'cd' in fll:
+                tag = (6, 'Media');
+            else:
+                tag = (0, 'Other');
+                
+            if fll[-4:] in ['.jpg', 'jpeg']:
+                imtype = 'image/jpg';
+            else:
+                imtype = 'image/png';
+                
+            dbg += "    -> found image: %s (%d, %s)\n" %(fl, tag[0], tag[1]);
+            imgf = open(os.path.join(_b, fl), 'rb')
+            img = imgf.read();
+            imgf.close();
+            
+            m.tags.add(mutid3.APIC(3, imtype, tag[0], tag[1], img));
+            
+    if tag != None:
+        m.save();
+
+    return (None, dbg);
+
 
 
 if __name__ == "__main__":
@@ -272,34 +245,26 @@ if __name__ == "__main__":
 
     print "-> loading hash list"
     if not os.path.exists(DBFILE):
-        flachashes = {}
+        FLACHASHES = {}
     else:
         fh_fl = open(DBFILE, 'r');
-        flachashes = pickle.load(fh_fl);
+        FLACHASHES = pickle.load(fh_fl);
         fh_fl.close();
     print "done"
 
-    print "-> performing sync with %d workers on %d tracks" %(NUMWORKERS, len(filequeue)-1)
-    workers = [];
-    workers_lk = threading.Semaphore();
-    i = 0
-    while i < len(filequeue):
-        if len(workers) < NUMWORKERS:
-            workers_lk.acquire();
-            workers.append( SyncWorker(flachashes, workers, workers_lk, filequeue[i][0], FORCE) );
-            workers[-1].start();
-            workers_lk.release();
-            i += 1
-        else:
-            time.sleep(0);
+    print "-> performing sync with %d workers on %d tracks" %(NUMWORKERS, len(filequeue));
+    pool = Pool(processes=NUMWORKERS);
+    result = pool.map_async(process_track, filequeue)
+    new_hashes = result.get();
 
-    while len(workers) > 0:
-        time.sleep(0);
+    for r in new_hashes:
+        if r != None:
+            FLACHASHES[r[0]] = r[1];
 
 
     print "-> saving hash list"
     fh_fl = open(DBFILE, 'w');
-    pickle.dump(flachashes, fh_fl);
+    pickle.dump(FLACHASHES, fh_fl);
     fh_fl.close();
     print "done"
 
