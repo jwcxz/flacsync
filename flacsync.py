@@ -10,40 +10,121 @@
 # program is probably i/o limited anyways.
 
 
-import argparse, hashlib, pickle, subprocess, sys, os, tempfile, time
+import argparse, ConfigParser, hashlib, pickle, subprocess, sys, os, tempfile, time
 from multiprocessing import Pool
-from mutagen import mp3 as mutmp3
-from mutagen import id3 as mutid3
+from mutagen import flac as mut_flac
+from mutagen import mp3 as mut_mp3
+from mutagen import id3 as mut_id3
 
-CFGBASE = os.path.expanduser("~/.flacsync");
-DBFILE = os.path.join(CFGBASE, "db");
-CFGFILE = os.path.join(CFGBASE, "config");
-LOGFILE = os.path.join(CFGBASE, "log");
 
-FILETBL = "flacs";
-NUMWORKERS = 8;
-MUSICDIR = os.path.expanduser("~/media/music");
-MP3DIR = "_mp3";
+class Config:
+    tagtable = {
+            'album'         : mut_id3.TALB,
+            'comment'       : mut_id3.COMM,
+            'encoded-by'    : mut_id3.TENC,
+            'performer'     : mut_id3.TOPE,
+            'copyright'     : mut_id3.TCOP,
+            'artist'        : mut_id3.TPE1,
+            'license'       : mut_id3.WXXX,
+            'title'         : mut_id3.TIT2,
+            'genre'         : mut_id3.TCON,
+            'albumartist'   : mut_id3.TPE2,
+            'composer'      : mut_id3.TCOM,
+            'date'          : mut_id3.TDRC,
+            'tracknumber'   : mut_id3.TRCK,
+            'discnumber'    : mut_id3.TPOS,
+            };
 
-tagtable = { 'title': '--tt',
-             'artist': '--ta',
-             'album': '--tl',
-             'year': '--ty',
-             'date': '--ty',
-             'comment': '--tc',
-             'tracknumber': '--tn',
-             'genre': '--tg' }
+    def __init__(self):
+        self.fsdir = "~/.flacsync"
 
+        self.config = os.path.expanduser(os.path.join(self.fsdir, "config"));
+
+        self.numworkers = 8;
+        self.musicdir = os.path.expanduser("~/media/music");
+        self.mp3dir = "_mp3";
+        self.force = False;
+
+        self.dbdata = {};
+        self.update_filevars();
+
+
+    def update_filevars(self):
+        self.dbfile = os.path.expanduser(os.path.join(self.fsdir, "db"));
+        self.logfile = os.path.expanduser(os.path.join(self.fsdir, "log"));
+
+
+    def apply_cfgfile(self, cfg):
+        cfg = os.path.expanduser(cfg);
+
+        if not os.path.exists(cfg) or os.path.isdir(cfg):
+            return;
+
+        cfgp = configparser.ConfigParser();
+        cfgp.read([self.config]);
+
+        for new in cfgp.items('flacsync'):
+            key, val = new;
+
+            if   key == "numworkers": self.numworkers = int(val);
+            elif key == "musicdir":   self.musicdir = os.path.expanduser(val);
+            elif key == "mp3dir":     self.mp3dir = val;
+            elif key == "fsdir":      self.fsdir = os.path.expanduser(val);
+
+            elif key == "force" and val.lower() == "true":
+                self.force = True;
+
+
+        self.update_filevars();
+
+
+    def apply_args(self, args):
+        if args.numworkers: self.numworkers = args.numworkers;
+        if args.mp3dir: self.mp3dir = args.mp3dir;
+        if args.force: self.force = args.force;
+        if args.musicdir: self.musicdir = os.path.expanduser(args.musicdir);
+        if args.fsdir: self.fsdir = os.path.expanduser(args.fsdir);
+
+        self.update_filevars();
+
+
+    def prepare_dirs(self):
+        self.fsdir = os.path.expanduser(self.fsdir);
+
+        if not os.path.exists(self.fsdir):
+            os.mkdir(self.fsdir);
+        elif not os.path.isdir(self.fsdir):
+            os.remove(self.fsdir);
+            os.mkdir(self.fsdir);
+
+        # make sure path exists
+        if not os.path.exists(self.musicdir) or not os.path.isdir(self.musicdir):
+            print "## ERROR: music directory %s not found" %(self.musicdir);
+            sys.exit(1);
+
+
+    def load_dbdata(self):
+        if not os.path.exists(self.dbfile):
+            self.dbdata = {}
+        else:
+            fh_fl = open(self.dbfile, 'r');
+            self.dbdata = pickle.load(fh_fl);
+            fh_fl.close();
+
+
+    def save_dbdata(self):
+        fh_fl = open(cfg.dbfile, 'w');
+        pickle.dump(self.dbdata, fh_fl);
+        fh_fl.close();
 
 
 def process_track(trackdata):
-    flac = trackdata[0];
+    flac, mtime, _num, _total, cfg = trackdata;
     dbg = "";
 
     try:
-        flac_esc = flac.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`');
         
-        dbg += "-> %s\n" %(flac);
+        dbg += "-> [%d/%d] %s\n" %(_num, _total, flac);
         
         # check hash
         x = open(flac, 'r');
@@ -53,9 +134,9 @@ def process_track(trackdata):
         x.close();
         digest = hashlib.md5(xd).hexdigest();
 
-        if not FORCE:
-            if flac_esc in FLACHASHES:
-                dbdgst = FLACHASHES[flac_esc];
+        if not cfg.force:
+            if flac in cfg.dbdata:
+                dbdgst = cfg.dbdata[flac];
             else:
                 dbdgst = None
 
@@ -68,29 +149,30 @@ def process_track(trackdata):
         # we need to sync this one
         # perform conversion
         dbg += "    converting...\n";
-        r, rdbg = transcode(flac, flac_esc);
 
-        dbg += rdbg;
+        xcode, xcode_dbg = transcode(flac, cfg);
+        dbg += xcode_dbg;
 
         # update hash or insert new row if the transcode was successful
-        if r == None:
+        if xcode == None:
             dbg += "    done!\n"
 
         print dbg;
-        return (flac_esc, digest);
+        return (flac, digest);
+
     except Exception as e:
         print "## %s %r: Exception!" %(flac, e);
-        f = open(LOGFILE, 'a');
+        f = open(cfg.logfile, 'a');
         f.write("ERR: Exception! %s %r\n" %(flac, e));
         f.close();
         return None;
 
 
-def transcode(flac, flac_esc):
+def transcode(flac, cfg):
     # convert flac to mp3
     _f = os.path.basename(flac);
     _b = os.path.dirname(flac);
-    _d = os.path.join(_b, MP3DIR);
+    _d = os.path.join(_b, cfg.mp3dir);
 
     dbg = "";
 
@@ -101,47 +183,31 @@ def transcode(flac, flac_esc):
         os.mkdir(_d);
 
     mp3 = os.path.join(_d, _f[:-4]+'mp3');
-    mp3_esc = mp3.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`');
 
     if os.path.exists(mp3):
         os.remove(mp3);
 
-    # extract available tags
-    tags = {};
-    x = os.popen("metaflac --export-tags-to=- \"%s\"" %(flac_esc));
-    r = x.read();
-    x.close();
-    for l in r.split('\n'):
-        if l != '':
-            _ = l.split('=', 1);
-            if len(_) == 2:
-                tags[_[0].lower()] = _[1];
-
-    # convert tags to MP3speak
-    tagopts = "";
-    for tag in tags.keys():
-        if tag in tagtable.keys():
-            if tag == 'tracknumber':
-                tagopts += "%s %s " %(tagtable[tag], tags[tag]);
-            else:
-                tagopts += "%s \"%s\" " %(tagtable[tag], tags[tag].replace('"', '\\"').replace('$', '\\$').replace('`', '\\`'));
 
     # transcode
-    flac_log = tempfile.NamedTemporaryFile(dir=CFGBASE);
-    lame_log = tempfile.NamedTemporaryFile(dir=CFGBASE);
-    
-    flac_cmd = "flac -s -cd \"%s\" 2>\"%s\"" \
-                %(flac_esc, flac_log.name);
+    flac_log = tempfile.NamedTemporaryFile(dir=cfg.fsdir);
+    lame_log = tempfile.NamedTemporaryFile(dir=cfg.fsdir);
 
-    lame_cmd = "lame --silent -V 0 --add-id3v2 %s - \"%s\" 2>\"%s\"" \
-                %(tagopts, mp3_esc, lame_log.name);
+    flac_cmd = ['flac', '-s', '-c', '-d', flac];
+    lame_cmd = ['lame', '--silent', '-V', '0', '-', mp3];
 
-    x = os.popen("%s | %s" %(flac_cmd, lame_cmd));
-    ret = x.close();
-    
+    flac_proc = subprocess.Popen(flac_cmd, stdout=subprocess.PIPE, stderr=flac_log);
+    lame_proc = subprocess.Popen(lame_cmd, stdin=flac_proc.stdout, stderr=lame_log);
+    flac_proc.stdout.close();
+    lame_proc.wait();
+    ret = lame_proc.returncode;
+
     if ret:
         dbg += "    ## ERROR: command returned %d\n" %(ret);
-        f = open(LOGFILE, 'a');
+
+        flac_log.seek(0);
+        lame_log.seek(0);
+
+        f = open(cfg.logfile, 'a');
         f.write("ERR: %s returned %d\n" %(flac, ret));
         f.write("     flac: %s" %(flac_log.read()));
         f.write("     lame: %s" %(lame_log.read()));
@@ -151,10 +217,53 @@ def transcode(flac, flac_esc):
 
         return (ret, dbg);
     
-    # otherwise search for pictures in the directory and apply them
+    flac_log.close();
+    lame_log.close();
+
+
+    # copy tags
+    ff = mut_flac.FLAC(flac);
+    mm = mut_mp3.MP3(mp3);
+
+    if not mm.tags:
+        mm.tags = mut_id3.ID3();
+
+    for tag in cfg.tagtable.keys():
+        if ff.has_key(tag):
+            id3tag = cfg.tagtable[tag];
+
+            if tag == 'comment':
+                if ff.has_key('description'):
+                    desc = ff['description'];
+                else: 
+                    desc = u'';
+
+                mm.tags.add( id3tag(encoding=3, lang='XXX', desc=desc, text=ff['comment']) );
+
+
+            elif tag == 'tracknumber':
+                if ff.has_key('tracktotal'):
+                    trck = u"%s/%s" % (ff[tag][0], ff['tracktotal'][0]);
+                else:
+                    trck = ff[tag];
+
+                mm.tags.add( id3tag(encoding=3, text=trck) );
+
+
+            elif tag == 'license':
+                mm.tags.add( id3tag(encoding=0, desc=u'', text=ff[tag]) );
+
+
+            else:
+                mm.tags.add( id3tag(encoding=3, text=ff[tag]) );
+
+        elif tag == 'albumartist':
+            mm.tags.add( cfg.tagtable[tag](encoding=3, text=u'VA') );
+
+
+    # copy photos
     files = os.listdir(_b);
     files.reverse();    # probably will get better results this way
-    m = mutmp3.MP3(mp3);
     tag = None;
     for fl in files:
         fll = fl.lower();
@@ -183,89 +292,100 @@ def transcode(flac, flac_esc):
             img = imgf.read();
             imgf.close();
             
-            m.tags.add(mutid3.APIC(3, imtype, tag[0], tag[1], img));
+            mm.tags.add(mut_id3.APIC(3, imtype, tag[0], tag[1], img));
             
-    if tag != None:
-        m.save();
 
+    mm.save();
     return (None, dbg);
 
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Converts FLACs to MP3s, preserving as much tag information as possible",
+    parser = argparse.ArgumentParser(
+            description="Converts FLACs to MP3s, preserving as much tag information as possible",
+            epilog="By default, flacsync stores state in ~/.flacsync and can read from ~/.flacsync/config",
             prog="flacsync");
 
+    cfg = Config();
+
+    parser.add_argument('-c', '--config', action='store',
+            dest='config', default=cfg.config,
+            help='configuration file');
+
+
     parser.add_argument('-n', '--num-workers', action='store',
-            dest='numworkers', default=NUMWORKERS, type=int, help='number of simultaneously working threads');
+            dest='numworkers', default=None, type=int, 
+            help='number of simultaneously working threads');
+
     parser.add_argument('-d', '--directory', action='store',
-            dest='musicdir', default=MUSICDIR, help='directory to operate on');
+            dest='musicdir', default=None,
+            help='directory to operate on');
+
     parser.add_argument('-m', '--mp3', action='store',
-            dest='mp3dir', default=MP3DIR, help='directory to store MP3s in');
+            dest='mp3dir', default=None,
+            help='directory to store MP3s in');
+
     parser.add_argument('-f', '--force', action='store_true',
-            dest='force', default=False, help='convert all discovered tracks');
-    
+            dest='force', default=False,
+            help='convert all discovered tracks');
+
+    parser.add_argument('-D', '--db-directory', action='store',
+            dest='fsdir', default=None,
+            help='database and logfile location');
+
     
     args = parser.parse_args();
-    MUSICDIR = os.path.expanduser(args.musicdir);
-    NUMWORKERS = args.numworkers;
-    MP3DIR = args.mp3dir;
-    FORCE = args.force;
-    
-    # make sure path exists
-    if not os.path.exists(MUSICDIR) or not os.path.isdir(MUSICDIR):
-        print "## ERROR: music directory %s not found" %(MUSICDIR);
-        sys.exit(1);
-    
-    if not os.path.exists(CFGBASE):
-        os.mkdir(CFGBASE);
-    elif not os.path.isdir(CFGBASE):
-        os.remove(CFGBASE);
-        os.mkdir(CFGBASE);
-        
+
+    # set configuration based on file
+    cfg.apply_cfgfile(args.config);
+
+    # override those values with arguments
+    cfg.apply_args(args);
+
+    cfg.prepare_dirs();
+
+
     # clear log file
-    f = open(LOGFILE, 'a');
+    f = open(cfg.logfile, 'a');
     f.write("---------------------------------------\n");
     f.close();
 
     # walk through the music directory looking for folders with FLACs
     print "-> searching for flacs...",
-    _ = os.popen("find \"%s\" -iname \"*.flac\" -type f -print0" %(MUSICDIR));
-    filelist = _.read();
-    _.close();
+    _ = ['find', cfg.musicdir, '-iname', "*.flac", '-type', 'f', '-print0'];
+    filelist = subprocess.check_output(_);
     filelist = filelist.split('\0');
     print "done"
 
     print "-> sorting queue by mtime...",
     filequeue = []
+    _total = len(filelist) - 1; # XXX: stupid hack to remove ""'s contribution
+    _num = 0;
+
     for track in filelist:
-        if track != "": filequeue.append( (track, os.stat(track).st_mtime) );
+        _num += 1;
+        if track != "":
+            filequeue.append( (track, os.stat(track).st_mtime, _num, _total, cfg) );
+
     filequeue.sort(key=lambda _: _[1], reverse=True);
     print "done!"
 
     print "-> loading hash list"
-    if not os.path.exists(DBFILE):
-        FLACHASHES = {}
-    else:
-        fh_fl = open(DBFILE, 'r');
-        FLACHASHES = pickle.load(fh_fl);
-        fh_fl.close();
+    cfg.load_dbdata();
     print "done"
 
-    print "-> performing sync with %d workers on %d tracks" %(NUMWORKERS, len(filequeue));
-    pool = Pool(processes=NUMWORKERS);
+    print "-> performing sync with %d workers on %d tracks" %(cfg.numworkers, len(filequeue));
+    pool = Pool(processes=cfg.numworkers);
     result = pool.map_async(process_track, filequeue)
     new_hashes = result.get();
 
     for r in new_hashes:
         if r != None:
-            FLACHASHES[r[0]] = r[1];
+            cfg.dbdata[r[0]] = r[1];
 
 
     print "-> saving hash list"
-    fh_fl = open(DBFILE, 'w');
-    pickle.dump(FLACHASHES, fh_fl);
-    fh_fl.close();
+    cfg.save_dbdata();
     print "done"
 
 
